@@ -1,94 +1,106 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 
-module Main where
+import Control.Exception (catch, catchJust, IOException)
+import Control.Monad (filterM, liftM, unless, guard)
+import Data.ByteString.Lazy (readFile)
+import Data.Digest.Pure.MD5 (md5)
+import Data.Map.Lazy (insert, fromList, toList, adjust)
+import Data.Maybe (listToMaybe)
+import GHC.IO.Exception (IOErrorType(..))
+import System.Directory (renameFile, removeFile, doesFileExist, getDirectoryContents, removeDirectoryRecursive, createDirectoryIfMissing, getCurrentDirectory, setCurrentDirectory)
+import System.Environment (getArgs, getEnvironment, getProgName)
+import System.Posix.Env (getEnv)
+import System.Exit (ExitCode(..), exitWith)
+import System.FilePath (hasExtension, replaceBaseName, takeBaseName, (</>), splitFileName)
+import System.IO (hPutStrLn, stderr, hGetLine, withFile, IOMode(..), hFileSize)
+import System.IO.Error (ioeGetErrorType, isDoesNotExistError)
+import System.Process (createProcess, waitForProcess, shell, CreateProcess(..))
 
-import           Control.Monad        (filterM, liftM, unless, guard)
-import           Control.Exception    (catch, catchJust, IOException)
-import           Data.Maybe           (listToMaybe)
--- import           Data.Typeable        (typeOf)
-import           Data.Map.Lazy        (insert, fromList, toList, adjust)
-import           Data.Digest.Pure.MD5 (md5)
-import           System.Process       (createProcess, waitForProcess, shell, CreateProcess(..))
-import           System.Environment   (getArgs, getEnvironment, getProgName)
-import  System.Posix.Env (getEnv)
-import           System.Exit          (ExitCode(..))
-import           System.FilePath      (replaceBaseName, hasExtension, takeBaseName, (</>))
-import           System.Directory     (renameFile, removeFile, doesFileExist,
-                                       getDirectoryContents, createDirectoryIfMissing, removeDirectoryRecursive)
-import           System.IO            (hPutStrLn, stderr, withFile, hGetLine, IOMode(..))
-import           System.IO.Error      (ioeGetErrorType, isDoesNotExistError)
-import           GHC.IO.Exception     (IOErrorType(..))
+-- import Debug.Trace (traceShow)
+-- traceShow' arg = traceShow arg arg
 
-import qualified Data.ByteString.Lazy as BL
-import           Debug.Trace          (trace)
-
-traceShow' :: Show a => a -> a
-traceShow' t = trace (show t) t
-
-md5' :: FilePath -> IO String
-md5' path = (show . md5) `liftM` BL.readFile path 
-
-metaDir :: String
 metaDir = ".redo"
 
 main :: IO ()
 main = do
-       mapM_ redo =<< getArgs
-       progName   <- getProgName
-       redoTarget <- getEnv "REDO_TARGET"
-       case (progName, redoTarget) of
-        ("redo-ifchanged", Just target) ->
-          mapM_ (writeMD5 target) =<< getArgs
-        ("redo-ifchanged", Nothing) -> error "Missing REDO_TARGET env"
-        _ -> return ()
-  where writeMD5 :: FilePath -> FilePath -> IO ()
-        writeMD5 redoTarget dep = writeFile (metaDir </> redoTarget </> dep ) =<< md5' dep
+  topDir <- getCurrentDirectory
+  getArgs >>= mapM_ (\arg -> do
+    let (dir, file) = splitFileName arg
+    setCurrentDirectory dir
+    redo file dir
+    setCurrentDirectory topDir)
+  progName <- getProgName
+  redoTarget' <- getEnv "REDO_TARGET"
+  case (progName, redoTarget') of
+    ("redo-ifchange", Just redoTarget) -> mapM_ (writeMD5 redoTarget) =<< getArgs
+    ("redo-ifchange", Nothing) -> error "Missing REDO_TARGET environment variable."
+    _ -> return ()
 
-redo :: String -> IO ()
-redo target = do
-  upToDate'<- upToDate target
-  unless upToDate' $  maybe printMissingDo redo' =<< redoPath target
-  where redo'        :: FilePath -> IO ()
-        redo' path   = do
-          catchJust (guard . isDoesNotExistError)
-            (removeDirectoryRecursive metaDepsDir)
-            (\_ ->  return ()) 
-          createDirectoryIfMissing True metaDepsDir
-          writeFile (metaDepsDir </> path) =<< md5' path
-          oldEnv <- getEnvironment
-          let newEnv = toList $ adjust (++ ":.") "PATH" $ insert "REDO_TARGET" target $ fromList oldEnv
-          (_,_,_,ph) <- createProcess $ (shell $ cmd path) {env = Just newEnv}
-          exit <- waitForProcess ph
-          case exit of
-           ExitSuccess -> renameFile tmp target
-           ExitFailure code -> do hPutStrLn stderr $ "redo.do exited with error: " ++ show code
+-- TODO: directory argument
+redo :: String -> FilePath -> IO ()
+redo target dir = do
+  upToDate' <- upToDate target
+  unless upToDate' $ maybe missingDo redo' =<< doPath target
+ where redo' :: FilePath -> IO ()
+       redo' path = do
+         hPutStrLn stderr $ "redo " ++ if dir == "./" then "" else show (dir </> target)
+         catchJust (guard . isDoesNotExistError)
+                   (removeDirectoryRecursive metaDepsDir)
+                   (\_ -> return ())
+         createDirectoryIfMissing True metaDepsDir
+         writeMD5 target path
+         oldEnv <- getEnvironment
+         let newEnv = toList $ adjust (++ ":.") "PATH" $ insert "REDO_TARGET" target $ fromList oldEnv
+         (_, _, _, ph) <- createProcess $ (shell $ cmd path) {env = Just newEnv}
+         exit <- waitForProcess ph
+         case exit of
+           ExitSuccess -> do
+             size <- fileSize tmp
+             if size > 0
+               then renameFile tmp target
+               else removeFile tmp
+           ExitFailure code -> do hPutStrLn stderr $ "Redo script exited with non-zero exit code: " ++ show code
                                   removeFile tmp
-        tmp          = target ++ "----redoing"
-        metaDepsDir = metaDir </> target
-        printMissingDo = do
-          exist <- doesFileExist target
-          unless exist $ error $ "No .do file '" ++ target ++ "'"
-        cmd path     = unwords ["sh -x", path, "0", takeBaseName target, tmp, ">", tmp]
+                                  exitWith $ ExitFailure code
+       tmp = target ++ "---redoing"
+       metaDepsDir = metaDir </> target
+       missingDo = do
+         exists <- doesFileExist target
+         unless exists $ error $ "No .do file found for target '" ++ target ++ "'"
+       cmd path = unwords ["sh -e", path, "0", takeBaseName target, tmp, ">", tmp]
 
-redoPath :: FilePath -> IO (Maybe FilePath)
-redoPath target = listToMaybe `liftM` filterM doesFileExist candidates
-    where candidates = (target ++ ".do") : [replaceBaseName target "default" ++ ".do" | hasExtension target]
+doPath :: FilePath -> IO (Maybe FilePath)
+doPath target = listToMaybe `liftM` filterM doesFileExist candidates
+  where candidates = (target ++ ".do") : if hasExtension target
+                                         then [replaceBaseName target "default" ++ ".do"]
+                                         else []
 
 upToDate :: FilePath -> IO Bool
 upToDate target = Control.Exception.catch
-                  (do exists <- doesFileExist target
-                      if exists
-                        then do deps <- getDirectoryContents (metaDir </> target)
-                                (traceShow' . and) `liftM` mapM depUpToDate deps
-                        else return False)
-                  (\ (_::IOException) -> return False)
-  where depUpToDate :: FilePath -> IO Bool 
-        depUpToDate dep = Control.Exception.catch
-                          (do oldMD5 <- withFile (metaDir </> target </> dep) ReadMode hGetLine
-                              newMD5 <- md5' dep
-                              doScript <- redoPath dep
-                              case doScript of
-                               Nothing -> return $ oldMD5 == newMD5
-                               Just _ -> do upToDate' <- upToDate dep
-                                            return $ (oldMD5 == newMD5) && upToDate')                          
-                          (\e -> return (ioeGetErrorType e == InappropriateType))
+  (do exists <- doesFileExist target
+      if exists
+        then do md5s <- getDirectoryContents (metaDir </> target)
+                and `liftM` mapM depUpToDate md5s
+        else return False)
+  (\(_ :: IOException) -> return False)
+ where depUpToDate :: String -> IO Bool
+       depUpToDate oldMD5 = Control.Exception.catch
+         (do dep <- withFile (metaDir </> target </> oldMD5) ReadMode hGetLine
+             newMD5 <- fileMD5 dep
+             doScript <- doPath dep
+             case doScript of
+               Nothing -> return $ oldMD5 == newMD5
+               Just _ -> do upToDate' <- upToDate dep
+                            return $ (oldMD5 == newMD5) && upToDate')
+         (\e -> return (ioeGetErrorType e == InappropriateType))
+
+fileMD5 :: FilePath -> IO String
+fileMD5 path = (show . md5) `liftM` Data.ByteString.Lazy.readFile path
+
+writeMD5 :: String -> FilePath -> IO ()
+writeMD5 redoTarget dep = do
+  md5is <- fileMD5 dep
+  writeFile (metaDir </> redoTarget </> md5is) dep
+
+fileSize :: FilePath -> IO Integer
+fileSize path = withFile path ReadMode hFileSize
