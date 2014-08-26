@@ -1,4 +1,7 @@
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# OPTIONS_HADDOCK prune #-}
+
+module Main where
 
 import Control.Exception (catch, catchJust, IOException)
 import Control.Monad (filterM, liftM, unless, guard)
@@ -19,6 +22,7 @@ import System.Process (createProcess, waitForProcess, shell, CreateProcess(..))
 -- import Debug.Trace (traceShow)
 -- traceShow' arg = traceShow arg arg
 
+-- | This is the directory that redo will store and read metadata
 metaDir = ".redo"
 
 main :: IO ()
@@ -37,7 +41,10 @@ main = do
     _ -> return ()
 
 -- TODO: directory argument
-redo :: String -> FilePath -> IO ()
+-- | Rebuild current target if changed    
+redo :: String                  -- ^ target (file) name
+        -> FilePath             -- ^ path
+        -> IO ()
 redo target dir = do
   upToDate' <- upToDate target
   unless upToDate' $ maybe missingDo redo' =<< doPath target
@@ -75,6 +82,7 @@ doPath target = listToMaybe `liftM` filterM doesFileExist candidates
                                          then [replaceBaseName target "default" ++ ".do"]
                                          else []
 
+-- | Check if file is up to date
 upToDate :: FilePath -> IO Bool
 upToDate target = Control.Exception.catch
   (do exists <- doesFileExist target
@@ -94,7 +102,9 @@ upToDate target = Control.Exception.catch
                             return $ (oldMD5 == newMD5) && upToDate')
          (\e -> return (ioeGetErrorType e == InappropriateType))
 
-fileMD5 :: FilePath -> IO String
+-- | Calculate the MD5 checksum of a file
+fileMD5 :: FilePath             -- ^ path to file
+           -> IO String         -- ^ 32 bytes of MD5 checksum
 fileMD5 path = (show . md5) `liftM` Data.ByteString.Lazy.readFile path
 
 writeMD5 :: String -> FilePath -> IO ()
